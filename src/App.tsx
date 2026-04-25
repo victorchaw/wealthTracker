@@ -29,7 +29,7 @@ const App = () => {
       <TooltipProvider>
         <Toaster />
         <Sonner position="top-center" />
-        <BrowserRouter>
+        <BrowserRouter basename={import.meta.env.BASE_URL}>
           <AuthProvider>
             <Routes>
               <Route path="/auth" element={<Auth />} />
