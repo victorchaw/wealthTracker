@@ -8,12 +8,50 @@ import { useQueryClient } from "@tanstack/react-query";
 import { formatMoney } from "@/lib/format";
 import { useProfile } from "@/hooks/useProfile";
 import { ManualEntryDialog } from "@/components/ManualEntryDialog";
+import { ExtractionReviewDialog } from "@/components/ExtractionReviewDialog";
 import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+
+type ScanExtraction = {
+  vendor: string | null;
+  date: string | null;
+  line_items: Array<{ date: string | null; description: string; amount: number; confidence?: number }>;
+  tax_total: number;
+  grand_total: number;
+  computed_total?: number;
+  validation_error?: boolean;
+  field_confidence?: {
+    vendor?: number;
+    date?: number;
+    tax_total?: number;
+    grand_total?: number;
+  };
+};
+
+const MAX_FILE_SIZE_BYTES = 20 * 1024 * 1024;
+
+async function extractEdgeFunctionError(err: unknown): Promise<string> {
+  if (err && typeof err === "object") {
+    const anyErr = err as { message?: string; context?: Response };
+    const context = anyErr.context;
+    if (context && typeof context === "object" && "text" in context) {
+      try {
+        const raw = await context.text();
+        const parsed = raw ? JSON.parse(raw) : null;
+        if (parsed?.error && typeof parsed.error === "string") return parsed.error;
+        if (raw) return raw;
+      } catch {
+        // fall through to generic message
+      }
+    }
+    if (anyErr.message) return anyErr.message;
+  }
+  return "Failed to scan receipt";
+}
 
 export function ScanReceiptButton() {
   const inputRef = useRef<HTMLInputElement>(null);
@@ -22,9 +60,19 @@ export function ScanReceiptButton() {
   const qc = useQueryClient();
   const [busy, setBusy] = useState(false);
   const [manualOpen, setManualOpen] = useState(false);
+  const [reviewOpen, setReviewOpen] = useState(false);
+  const [reviewImageUrl, setReviewImageUrl] = useState<string>("");
+  const [reviewExtraction, setReviewExtraction] = useState<ScanExtraction | null>(null);
 
   async function handleFile(file: File) {
     if (!user) return;
+
+    if (file.size > MAX_FILE_SIZE_BYTES) {
+      toast.error("Image too large. Please upload a file up to 20MB.");
+      if (inputRef.current) inputRef.current.value = "";
+      return;
+    }
+
     setBusy(true);
     try {
       // Upload to receipts bucket
@@ -33,33 +81,46 @@ export function ScanReceiptButton() {
       const { error: upErr } = await supabase.storage.from("receipts").upload(path, file, { upsert: false });
       if (upErr) throw upErr;
 
-      // Get a signed URL for the AI to read
-      const { data: signed } = await supabase.storage.from("receipts").createSignedUrl(path, 60 * 5);
-      if (!signed?.signedUrl) throw new Error("Could not generate file URL");
-
-      // Convert to base64 data URL for the AI gateway
-      const buf = await file.arrayBuffer();
-      const b64 = btoa(String.fromCharCode(...new Uint8Array(buf)));
-      const dataUrl = `data:${file.type || "image/jpeg"};base64,${b64}`;
+      const { data: signed, error: signedErr } = await supabase.storage.from("receipts").createSignedUrl(path, 60 * 10);
+      if (signedErr || !signed?.signedUrl) throw new Error("Could not generate signed URL for uploaded image");
 
       const { data, error } = await supabase.functions.invoke("scan-receipt", {
-        body: { image: dataUrl, storage_path: path },
+        body: {
+          image: signed.signedUrl,
+          image_url: signed.signedUrl,
+          storage_path: path,
+        },
       });
       if (error) throw error;
 
       const txn = data?.transaction;
-      if (txn) {
-        toast.success(
-          `Saved ${formatMoney(Number(txn.amount), profile?.base_currency || "USD")} · ${txn.category_emoji ?? ""} ${txn.category_name ?? ""}`,
-          { description: "Tap Transactions to edit." }
-        );
-      } else {
-        toast.success("Receipt saved");
+      const extraction = data?.extraction as ScanExtraction | undefined;
+
+      if (!txn) {
+        throw new Error(data?.error || "Scan completed but no transaction was saved");
       }
+
+      if (extraction) {
+        setReviewImageUrl(signed.signedUrl);
+        setReviewExtraction(extraction);
+        setReviewOpen(true);
+
+        if (extraction.validation_error) {
+          toast.warning("Validation mismatch detected", {
+            description: "Line items + taxes do not match grand total.",
+          });
+        }
+      }
+
+      toast.success(
+        `Saved ${formatMoney(Number(txn.amount), profile?.base_currency || "USD")} · ${txn.category_emoji ?? ""} ${txn.category_name ?? ""}`,
+        { description: "Tap Transactions to edit." }
+      );
       qc.invalidateQueries({ queryKey: ["transactions"] });
     } catch (err: any) {
       console.error(err);
-      toast.error(err.message ?? "Failed to scan receipt");
+      const message = await extractEdgeFunctionError(err);
+      toast.error(message);
     } finally {
       setBusy(false);
       if (inputRef.current) inputRef.current.value = "";
@@ -97,6 +158,13 @@ export function ScanReceiptButton() {
         </DropdownMenuContent>
       </DropdownMenu>
       <ManualEntryDialog open={manualOpen} onOpenChange={setManualOpen} />
+      <ExtractionReviewDialog
+        open={reviewOpen}
+        onOpenChange={setReviewOpen}
+        imageUrl={reviewImageUrl}
+        extraction={reviewExtraction}
+        currency={profile?.base_currency || "USD"}
+      />
     </>
   );
 }
