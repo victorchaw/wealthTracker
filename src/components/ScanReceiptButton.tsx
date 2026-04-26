@@ -127,36 +127,39 @@ export function ScanReceiptButton() {
     }
   }
 
-  return (
-    <>
-      <input
-        ref={inputRef}
-        type="file"
-        accept="image/*"
-        capture="environment"
-        className="hidden"
-        onChange={(e) => e.target.files?.[0] && handleFile(e.target.files[0])}
-      />
-      <DropdownMenu>
-        <DropdownMenuTrigger asChild>
-          <Button
-            size="lg"
-            disabled={busy}
-            className="fixed bottom-6 right-6 z-50 h-14 rounded-full shadow-glow gradient-primary text-primary-foreground hover:opacity-95 px-6 gap-2 md:bottom-8 md:right-8"
-          >
-            {busy ? <Loader2 className="h-5 w-5 animate-spin" /> : <Plus className="h-5 w-5" />}
-            <span className="font-semibold">{busy ? "Reading…" : "Scan receipt"}</span>
-          </Button>
-        </DropdownMenuTrigger>
-        <DropdownMenuContent align="end" className="w-56">
-          <DropdownMenuItem onSelect={() => inputRef.current?.click()} className="gap-2">
-            <Camera className="h-4 w-4" /> Scan a receipt
-          </DropdownMenuItem>
-          <DropdownMenuItem onSelect={() => setManualOpen(true)} className="gap-2">
-            <Plus className="h-4 w-4" /> Add manually
-          </DropdownMenuItem>
-        </DropdownMenuContent>
-      </DropdownMenu>
+   return (
+     <>
+       <input
+         ref={inputRef}
+         type="file"
+         accept="image/*"
+         className="hidden"
+         onChange={(e) => e.target.files?.[0] && handleFile(e.target.files[0])}
+       />
+       <DropdownMenu>
+         <DropdownMenuTrigger asChild>
+           <Button
+             size="lg"
+             disabled={busy}
+             className="fixed bottom-6 right-6 z-50 h-14 rounded-full shadow-glow gradient-primary text-primary-foreground hover:opacity-95 px-6 gap-2 md:bottom-8 md:right-8"
+           >
+             {busy ? <Loader2 className="h-5 w-5 animate-spin" /> : <Plus className="h-5 w-5" />}
+             <span className="font-semibold">{busy ? "Reading…" : "Scan receipt"}</span>
+           </Button>
+         </DropdownMenuTrigger>
+         <DropdownMenuContent align="end" className="w-56">
+           <DropdownMenuItem onSelect={() => { if (inputRef.current) { inputRef.current.setAttribute("capture", "environment"); inputRef.current.click(); } }} className="gap-2">
+             <Camera className="h-4 w-4" /> Take a photo
+           </DropdownMenuItem>
+           <DropdownMenuItem onSelect={() => { if (inputRef.current) { inputRef.current.removeAttribute("capture"); inputRef.current.click(); } }} className="gap-2">
+             <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="lucide lucide-image"><rect width="18" height="18" x="3" y="3" rx="2" ry="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"/></svg>
+             Choose from library
+           </DropdownMenuItem>
+           <DropdownMenuItem onSelect={() => setManualOpen(true)} className="gap-2">
+             <Plus className="h-4 w-4" /> Add manually
+           </DropdownMenuItem>
+         </DropdownMenuContent>
+       </DropdownMenu>
       <ManualEntryDialog open={manualOpen} onOpenChange={setManualOpen} />
       <ExtractionReviewDialog
         open={reviewOpen}
