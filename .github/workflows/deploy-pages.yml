@@ -35,7 +35,7 @@ jobs:
         run: npm ci
 
       - name: Build
-        run: npm run build -- --base="/idea-to-app-translator/"
+        run: npm run build -- --base="/wealthTracker/"
 
       - name: Add SPA 404 fallback
         run: cp dist/index.html dist/404.html
