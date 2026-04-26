@@ -34,6 +34,26 @@ type ScanExtraction = {
 
 const MAX_FILE_SIZE_BYTES = 20 * 1024 * 1024;
 
+async function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function retryWithBackoff<T>(fn: () => Promise<T>, maxAttempts = 3, baseDelay = 800): Promise<T> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastError = err;
+      const isLastAttempt = attempt === maxAttempts - 1;
+      if (isLastAttempt) break;
+      const delay = baseDelay * 2 ** attempt;
+      await sleep(delay);
+    }
+  }
+  throw lastError;
+}
+
 async function extractEdgeFunctionError(err: unknown): Promise<string> {
   if (err && typeof err === "object") {
     const anyErr = err as { message?: string; context?: Response };
@@ -75,22 +95,30 @@ export function ScanReceiptButton() {
 
     setBusy(true);
     try {
-      // Upload to receipts bucket
+      // Upload to receipts bucket with retry (upsert:true makes retries safe)
       const ext = file.name.split(".").pop() || "jpg";
       const path = `${user.id}/${Date.now()}.${ext}`;
-      const { error: upErr } = await supabase.storage.from("receipts").upload(path, file, { upsert: false });
+      const { error: upErr } = await retryWithBackoff(
+        () => supabase.storage.from("receipts").upload(path, file, { upsert: true }),
+        2,
+        1000
+      );
       if (upErr) throw upErr;
 
       const { data: signed, error: signedErr } = await supabase.storage.from("receipts").createSignedUrl(path, 60 * 10);
       if (signedErr || !signed?.signedUrl) throw new Error("Could not generate signed URL for uploaded image");
 
-      const { data, error } = await supabase.functions.invoke("scan-receipt", {
-        body: {
-          image: signed.signedUrl,
-          image_url: signed.signedUrl,
-          storage_path: path,
-        },
-      });
+      const { data, error } = await retryWithBackoff(
+        () => supabase.functions.invoke("scan-receipt", {
+          body: {
+            image: signed.signedUrl,
+            image_url: signed.signedUrl,
+            storage_path: path,
+          },
+        }),
+        2,
+        1000
+      );
       if (error) throw error;
 
       const txn = data?.transaction;

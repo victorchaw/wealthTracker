@@ -50,6 +50,22 @@ function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+async function retryWithBackoff<T>(fn: () => Promise<T>, maxAttempts = 4, baseDelay = 1000): Promise<T> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastError = err;
+      const isLastAttempt = attempt === maxAttempts - 1;
+      if (isLastAttempt) break;
+      const delay = baseDelay * 2 ** attempt;
+      await sleep(delay);
+    }
+  }
+  throw lastError;
+}
+
 function round2(value: number) {
   return Math.round((value + Number.EPSILON) * 100) / 100;
 }
@@ -131,7 +147,7 @@ async function imagePayloadToBlob(payload: string): Promise<{ blob: Blob; mimeTy
 async function uploadToLlamaParse(blob: Blob, extension: string, apiKey: string) {
   let lastError = "Unknown upload failure";
 
-  for (const base of LLAMA_UPLOAD_BASES) {
+  const tryUpload = async (base: string): Promise<{ base: string, jobId: string }> => {
     const formData = new FormData();
     formData.append("file", blob, `statement.${extension}`);
     formData.append("result_type", "markdown");
@@ -146,31 +162,47 @@ async function uploadToLlamaParse(blob: Blob, extension: string, apiKey: string)
       body: formData,
     });
 
-    if (response.ok) {
-      const uploadJson = await response.json();
-      const jobId =
-        uploadJson?.id ??
-        uploadJson?.job_id ??
-        uploadJson?.jobId ??
-        uploadJson?.parsing_job_id ??
-        uploadJson?.data?.id ??
-        uploadJson?.data?.job_id;
-
-      if (!jobId) throw new Error("LlamaParse upload succeeded but no job id returned");
-
-      return { base, jobId: String(jobId) };
+    if (!response.ok) {
+      const body = await response.text();
+      throw new Error(`Upload failed (${response.status}): ${body}`);
     }
 
-    lastError = await response.text();
+    const uploadJson = await response.json();
+    const jobId =
+      uploadJson?.id ??
+      uploadJson?.job_id ??
+      uploadJson?.jobId ??
+      uploadJson?.parsing_job_id ??
+      uploadJson?.data?.id ??
+      uploadJson?.data?.job_id;
+
+    if (!jobId) throw new Error("LlamaParse upload succeeded but no job id returned");
+
+    return { base, jobId: String(jobId) };
+  };
+
+  // Try each endpoint with retry, but fail fast on fatal errors
+  for (const base of LLAMA_UPLOAD_BASES) {
+    try {
+      const result = await retryWithBackoff(() => tryUpload(base));
+      return result;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      // Don't retry on auth/invalid key errors
+      if (msg.includes("401") || msg.includes("403") || msg.includes("Invalid API key")) {
+        throw err;
+      }
+      lastError = msg;
+    }
   }
 
-  throw new Error(`LlamaParse upload failed: ${lastError}`);
+  throw new Error(`LlamaParse upload failed after retries: ${lastError}`);
 }
 
 async function fetchLlamaParseMarkdown(base: string, jobId: string, apiKey: string) {
   const endpoint = `${base}/job/${jobId}/result/markdown`;
 
-  for (let attempt = 0; attempt < 30; attempt += 1) {
+  const attemptFetch = async (): Promise<string> => {
     const response = await fetch(endpoint, {
       headers: {
         Authorization: `Bearer ${apiKey}`,
@@ -193,21 +225,30 @@ async function fetchLlamaParseMarkdown(base: string, jobId: string, apiKey: stri
         return markdown;
       }
 
-      const markdown = await response.text();
-      if (!markdown.trim()) throw new Error("LlamaParse returned empty markdown text");
-      return markdown;
+      const markdownText = await response.text();
+      if (!markdownText.trim()) throw new Error("LlamaParse returned empty markdown text");
+      return markdownText;
     }
 
-    if ([202, 404, 409, 425].includes(response.status)) {
-      await sleep(2000);
-      continue;
+    // Retry on these statuses, throw on others
+    if ([202, 404, 409, 425, 429, 500, 502, 503, 504].includes(response.status)) {
+      const body = await response.text();
+      throw new Error(`Retryable error (${response.status}): ${body}`);
     }
 
     const body = await response.text();
     throw new Error(`LlamaParse result fetch failed (${response.status}): ${body}`);
-  }
+  };
 
-  throw new Error("LlamaParse timed out while generating markdown");
+  try {
+    return await retryWithBackoff(attemptFetch, 6, 1500);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg.includes("401") || msg.includes("403") || msg.includes("Invalid API key")) {
+      throw new Error("LlamaParse authentication failed. Check your API key.");
+    }
+    throw err;
+  }
 }
 
 async function parseWithLlamaParse(imagePayload: string, apiKey: string) {
@@ -394,6 +435,7 @@ Deno.serve(async (req) => {
       global: { headers: { Authorization: auth } },
     });
 
+    // Verify user
     const {
       data: { user },
       error: userErr,
@@ -410,18 +452,28 @@ Deno.serve(async (req) => {
     let markdown: string;
     try {
       markdown = await parseWithLlamaParse(imageInput, LLAMAPARSE_API_KEY);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      if (!msg.includes("Failed to fetch image payload") || !storage_path) throw err;
-
-      const { data: fileBlob, error: downloadErr } = await supabase.storage.from("receipts").download(storage_path);
-      if (downloadErr || !fileBlob) {
-        throw new Error(`Failed to fetch image payload and storage download fallback failed: ${downloadErr?.message ?? "unknown"}`);
-      }
-
-      const fallbackExt = inferExtensionFromPath(storage_path);
-      markdown = await parseBlobWithLlamaParse(fileBlob, fallbackExt, LLAMAPARSE_API_KEY);
-    }
+     } catch (err) {
+       const errMsg = err instanceof Error ? err.message : String(err);
+       // If the signed URL fetch failed, try to download from storage
+       if ((errMsg.includes("Failed to fetch image payload") || errMsg.includes("fetch failed")) && storage_path) {
+         const result = await retryWithBackoff(
+           async () => {
+             const res = await supabase.storage.from("receipts").download(storage_path);
+             return { data: res.data, error: res.error };
+           },
+           2,
+           500
+         );
+         const { data: fileBlob, error: downloadErr } = result;
+         if (downloadErr || !fileBlob) {
+           throw new Error(`Failed to fetch image payload and storage download fallback failed: ${downloadErr?.message ?? "unknown"}`);
+         }
+         const fallbackExt = inferExtensionFromPath(storage_path);
+         markdown = await parseBlobWithLlamaParse(fileBlob, fallbackExt, LLAMAPARSE_API_KEY);
+       } else {
+         throw err;
+       }
+     }
 
     const extracted = parseLlamaMarkdown(markdown);
 
@@ -438,41 +490,85 @@ Deno.serve(async (req) => {
       .eq("kind", "expense");
 
     const inferred = selectCategoryFromVendor(extracted.vendor);
-    const lc = (s: string) => s.toLowerCase().trim();
-    const matched = (categories ?? []).find((c) => lc(c.name) === lc(inferred.name));
 
     let categoryId: string | null = null;
     let categoryEmoji = inferred.emoji;
     let categoryName = inferred.name;
+
+    // Try to find existing category with retry, then upsert if not found
+    let categoriesResult: any[] | null = null;
+    try {
+      categoriesResult = await retryWithBackoff(
+        async () => (await supabase.from("categories")
+          .select("id, name, emoji, kind")
+          .eq("user_id", user.id)
+          .eq("kind", "expense")).data,
+        2,
+        500
+      );
+    } catch (e) {
+      console.warn("Failed to fetch categories:", e);
+    }
+
+    const lc = (s: string) => s.toLowerCase().trim();
+    const matched = categoriesResult?.find((c) => lc(c.name) === lc(inferred.name));
 
     if (matched) {
       categoryId = matched.id;
       categoryEmoji = matched.emoji;
       categoryName = matched.name;
     } else {
-      const { data: createdCategory } = await supabase
-        .from("categories")
-        .insert({
-          user_id: user.id,
-          name: inferred.name,
-          emoji: inferred.emoji,
-          kind: "expense",
-          color: "hsl(258 90% 66%)",
-          sort_order: 99,
-        })
-        .select()
-        .single();
+      // Attempt to create the category; on conflict (duplicate race), fetch the existing one
+      try {
+        const { data: createdCategory } = await supabase
+          .from("categories")
+          .insert({
+            user_id: user.id,
+            name: inferred.name,
+            emoji: inferred.emoji,
+            kind: "expense",
+            color: "hsl(258 90% 66%)",
+            sort_order: 99,
+          })
+          .select()
+          .single();
 
-      if (createdCategory) {
-        categoryId = createdCategory.id;
-        categoryEmoji = createdCategory.emoji;
-        categoryName = createdCategory.name;
+        if (createdCategory) {
+          categoryId = createdCategory.id;
+          categoryEmoji = createdCategory.emoji;
+          categoryName = createdCategory.name;
+        }
+      } catch (insertErr: any) {
+        // Unique constraint violation: another concurrent insert created it
+        const msg = insertErr?.message ?? "";
+        if (msg.includes("unique") || msg.includes("duplicate") || (insertErr as any)?.code === "23505") {
+          const existing = await supabase
+            .from("categories")
+            .select("id, name, emoji")
+            .eq("user_id", user.id)
+            .eq("kind", "expense")
+            .eq("name", inferred.name)
+            .maybeSingle();
+          if (existing.data) {
+            categoryId = existing.data.id;
+            categoryEmoji = existing.data.emoji;
+            categoryName = existing.data.name;
+          } else {
+            throw insertErr; // re-raise if we still can't find it
+          }
+        } else {
+          throw insertErr; // re-raise non-unique errors
+        }
       }
     }
 
     let receiptUrl: string | null = null;
     if (storage_path) {
-      const { data: signed } = await supabase.storage.from("receipts").createSignedUrl(storage_path, 60 * 60 * 24 * 365);
+      const { data: signed } = await retryWithBackoff(
+        () => supabase.storage.from("receipts").createSignedUrl(storage_path, 60 * 60 * 24 * 365),
+        2,
+        500
+      );
       receiptUrl = signed?.signedUrl ?? null;
     }
 
@@ -498,27 +594,61 @@ Deno.serve(async (req) => {
       markdown,
     };
 
-    const { data: txn, error: txErr } = await supabase
-      .from("transactions")
-      .insert({
-        user_id: user.id,
-        amount: finalAmount,
-        kind: "expense",
-        merchant: extracted.vendor,
-        description:
-          extracted.line_items.length > 0
-            ? `${extracted.line_items.length} extracted line item${extracted.line_items.length > 1 ? "s" : ""}`
-            : "Parsed statement",
-        category_id: categoryId,
-        occurred_at: occurredAt,
-        receipt_url: receiptUrl,
-        source: "scan",
-        raw_ocr: extractionPayload,
-      })
-      .select()
-      .single();
+    // Fetch categories and insert transaction with retry for transient failures
+    const categoryPromise = retryWithBackoff(
+      async () => (await supabase.from("categories")
+        .select("id, name, emoji, kind")
+        .eq("user_id", user.id)
+        .eq("kind", "expense")).data,
+      2,
+      500
+    );
+
+    const txnPromise = retryWithBackoff(
+      async () => await supabase
+        .from("transactions")
+        .insert({
+          user_id: user.id,
+          amount: finalAmount,
+          kind: "expense",
+          merchant: extracted.vendor,
+          description:
+            extracted.line_items.length > 0
+              ? `${extracted.line_items.length} extracted line item${extracted.line_items.length > 1 ? "s" : ""}`
+              : "Parsed statement",
+          category_id: categoryId,
+          occurred_at: occurredAt,
+          receipt_url: receiptUrl,
+          source: "scan",
+          raw_ocr: extractionPayload,
+        })
+        .select()
+        .single(),
+      2,
+      500
+    );
+
+    // Execute in parallel
+    const [categoriesResult, { data: txn, error: txErr }] = await Promise.all([categoryPromise, txnPromise]);
 
     if (txErr) throw txErr;
+
+    if (!categoryId && categoriesResult && categoriesResult.length > 0) {
+      // Re-check categories after fetch (handles race with concurrent inserts from same user)
+      const lc = (s: string) => s.toLowerCase().trim();
+      const matchedAfter = categoriesResult.find((c) => lc(c.name) === lc(inferred.name));
+      if (matchedAfter) {
+        categoryId = matchedAfter.id;
+        categoryEmoji = matchedAfter.emoji;
+        categoryName = matchedAfter.name;
+      }
+    }
+
+    return jsonResponse({
+      transaction: { ...txn, category_emoji: categoryEmoji, category_name: categoryName },
+      extraction: extractionPayload,
+      validation_error: validationError,
+    });
 
     return jsonResponse({
       transaction: { ...txn, category_emoji: categoryEmoji, category_name: categoryName },
