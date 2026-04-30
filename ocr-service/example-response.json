@@ -1,0 +1,9 @@
+{
+  "amount": 12.50,
+  "merchant": "Blue Bottle Coffee",
+  "date": "2026-04-29T10:13:00Z",
+  "category": "Food",
+  "note": "Blue Bottle Coffee; Latte — 4.50; Croissant — 3.00; Tax — 1.00",
+  "currency": "USD",
+  "confidence": 0.94
+}
